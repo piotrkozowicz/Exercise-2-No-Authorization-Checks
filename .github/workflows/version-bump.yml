@@ -1,0 +1,81 @@
+name: Auto Bump Versions
+
+# ChatOps helper: a maintainer comments "/version <level>" on a pull request and
+# the bot bumps the project version on that PR's branch, then acknowledges on the PR.
+#
+# issue_comment ALWAYS runs from the workflow definition on the base repo's default
+# branch, with the base repo's GITHUB_TOKEN — even when the comment is on a PR opened
+# from a fork. That is what makes the elevated token available to this job.
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  bump:
+    name: Bump version on /version command
+    # React only to comments on a pull request that begin with the command word.
+    if: >
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/version')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # push the version-bump commit
+      pull-requests: write      # leave a confirmation comment
+
+    steps:
+      - name: Resolve the pull request branch
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            core.setOutput('repo', pr.data.head.repo.full_name);
+            core.setOutput('ref',  pr.data.head.ref);
+            core.setOutput('sha',  pr.data.head.sha);
+
+      # Checks out the contributor's fork at the PR head — i.e. attacker-controlled code.
+      - name: Check out the PR branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pr.outputs.repo }}
+          ref: ${{ steps.pr.outputs.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine bump level
+        id: level
+        run: |
+          # comment body looks like:  /version minor
+          LEVEL="$(echo "${{ github.event.comment.body }}" | awk '{print $2}')"
+          echo "level=${LEVEL:-patch}" >> "$GITHUB_OUTPUT"
+
+      # Runs the fork's copy of version.sh with the base repo's write-scoped token.
+      - name: Run version bump
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          chmod +x ./scripts/version.sh
+          ./scripts/version.sh -u -l "${{ steps.level.outputs.level }}"
+
+      - name: Commit and push the bump
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name  "swiftdrop-bot"
+          git config user.email "bot@swiftdrop.local"
+          git commit -am "chore: bump version (${{ steps.level.outputs.level }})" || echo "nothing to commit"
+          git push origin HEAD:${{ steps.pr.outputs.ref }}
+
+      - name: Acknowledge on the PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '🤖 Version bumped (`${{ steps.level.outputs.level }}`). Thanks!',
+            });
